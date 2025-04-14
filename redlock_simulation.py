@@ -6,53 +6,62 @@ import multiprocessing
 client_processes_waiting = [0, 5, 6, 10, 12]
 
 class Redlock:
-    def __init__(self, redis_nodes):
-        """
-        Initialize Redlock with a list of Redis node addresses.
-        :param redis_nodes: List of (host, port) tuples.
-        """
-        self.redis_clients = [redis.Redis(host=host, port=port, decode_responses=True) for host, port in redis_nodes]
-        self.target = len(self.redis_clients) // 2 + 1
-        self.ttl = 5000 
+    def __init__(self, redis_cluster_nodes):
+        # Create connection 
+        self.redis_connections = []
+        for hostname, port_number in redis_cluster_nodes:
+            connection = redis.Redis(
+                host=hostname, 
+                port=port_number, 
+                decode_responses=True,
+                socket_connect_timeout=2.0
+            )
+            self.redis_connections.append(connection)
+            
+        # target
+        self.quorum_size = (len(self.redis_connections) // 2) + 1
         
-    def acquire_lock(self, resource, ttl):
-        """
-        Try to acquire a distributed lock.
-        :param resource: The name of the resource to lock.
-        :param ttl: Time-to-live for the lock in milliseconds.
-        :return: Tuple (lock_acquired, lock_id).
-        """
-        lock_id = str(uuid.uuid4())
-        end_time = time.time() + (ttl / 1000)
-        taken_clients = 0
-
-        for redis_client in self.redis_clients:
+        # ttl time
+        self.default_expiry = 5000
+        
+    def acquire_lock(self, resource_key, expiry_time_ms):
+        unique_token = f"lock:{str(uuid.uuid4())}"
+        deadline = time.time() + (expiry_time_ms / 1000.0) * 0.5
+        successful_locks = 0
+        
+        # Try to acquire lock 
+        for redis_instance in self.redis_connections:
             try:
-                if redis_client.set(resource, lock_id, nx=True, px=ttl):
-                    taken_clients += 1
-            except redis.ConnectionError:
-                print("Failed to connect to acquire lockk")
-
-        if time.time() <= end_time and taken_clients >= self.target:
-            return True, lock_id
+                if redis_instance.set(
+                    resource_key,
+                    unique_token,
+                    nx=True,
+                    px=expiry_time_ms
+                ):
+                    successful_locks += 1
+            except redis.exceptions.ConnectionError:
+                print("Connection failed during lock acquisition")
         
-        self.release_lock(resource, lock_id)
+        # Check if we got enough locks 
+        if time.time() <= deadline and successful_locks >= self.quorum_size:
+            return True, unique_token
+        
+        # If not enough locks were acquired, clean up
+        self._clean_lock(resource_key, unique_token)
         return False, None
-
-    def release_lock(self, resource, lock_id):
-        """
-        Release the distributed lock.
-        :param resource: The name of the resource to unlock.
-        :param lock_id: The unique lock ID to verify ownership.
-        """
-        for redis_client in self.redis_clients:
+    
+    def release_lock(self, resource_key, lock_token):
+        self._clean_lock(resource_key, lock_token)
+    
+    def _clean_lock(self, resource_key, lock_token):
+        for redis_instance in self.redis_connections:
             try:
-                stored_value = redis_client.get(resource)
-                if stored_value and stored_value == lock_id:
-                    redis_client.delete(resource)
-            except redis.ConnectionError:
-                print("Failed to connect to release lock")
-
+                current_value = redis_instance.get(resource_key)
+                if current_value and current_value == lock_token:
+                    # Remove our lock
+                    redis_instance.delete(resource_key)
+            except redis.exceptions.ConnectionError:
+                print("Connection failed during lock cleanup")
 
 def client_process(redis_nodes, resource, ttl, client_id):
     """
